@@ -19,7 +19,7 @@ from .tools import CallException, expect, normalize_nfc, session
 
 
 @session
-def sign_special_tx(client, inputs, outputs, details, prev_txes=None):
+def sign_special_tx(client, inputs, outputs, details, prev_txes=None, external_txes=None):
     # set up a transactions dict
     txes = {None: messages.TransactionType(inputs=inputs, outputs=outputs)}
     # preload all relevant transactions ahead of time
@@ -36,6 +36,15 @@ def sign_special_tx(client, inputs, outputs, details, prev_txes=None):
             if not isinstance(prev_tx, messages.TransactionType):
                 raise ValueError("Invalid value for prev_tx") from None
             txes[inp.prev_hash] = prev_tx
+    if external_txes:
+        for txid in external_txes:
+            try:
+                prev_tx = prev_txes[txid]
+            except Exception as e:
+                raise ValueError("Could not retrieve prev_tx") from e
+            if not isinstance(prev_tx, messages.TransactionType):
+                raise ValueError("Invalid value for prev_tx") from None
+            txes[txid] = prev_tx
 
     details.inputs_count = len(inputs)
     details.outputs_count = len(outputs)
