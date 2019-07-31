@@ -41,6 +41,8 @@ _BIP32_CHANGE_CHAIN = const(1)
 # use and still allow to quickly brute-force the correct bip32 path
 _BIP32_MAX_LAST_ELEMENT = const(1000000)
 
+_DASH_COIN = 100000000
+
 
 class SigningError(ValueError):
     pass
@@ -67,7 +69,58 @@ def _encode_compact_int(n):
     return bytes(w)
 
 
-def _get_proregtx_payload(tx, inputs_hash):
+def _inet_ntoa(data: bytes) -> str:
+    if data is None:
+        return "0.0.0.0"
+    # this is IPv4 mapped IPv6 address,  can get only 4 last bytes
+    return ".".join("{}".format(data[i]) for i in [12, 13, 14, 15])
+
+
+def _is_p2pkh_script(data: bytes) -> bool:
+    if not len(data) == 25:
+        return False
+    if not data[0] == 0x76:
+        return False
+    if not data[1] == 0xA9:
+        return False
+    if not data[2] == 0x14:
+        return False
+    if not data[-1] == 0xAC:
+        return False
+    if not data[-2] == 0x88:
+        return False
+    return True
+
+
+def _is_p2sh_script(data: bytes) -> bool:
+    if not len(data) == 23:
+        return False
+    if not data[0] == 0xA9:
+        return False
+    if not data[1] == 0x14:
+        return False
+    if not data[-1] == 0x88:
+        return False
+    return True
+
+
+def _address_pkh_from_keyid(keyid: bytes, coin: coininfo.CoinInfo) -> str:
+    s = address_type.tobytes(coin.address_type) + keyid
+    return base58.encode_check(bytes(s), coin.b58_hash)
+
+
+def _address_from_script(data: bytes, coin: coininfo.CoinInfo) -> str:
+    if _is_p2pkh_script(data):
+        return _address_pkh_from_keyid(data[3:23], coin)
+    if _is_p2sh_script(data):
+        return addresses.address_p2sh(data[2:22], coin)
+    raise SigningError(
+        FailureType.ProcessError,
+        "Unsupported payout script type"
+    )
+
+
+def _get_proregtx_payload_comtent(tx, inputs_hash):
     r = bytes()
     r += pack("<H", tx.payload_version)
     r += pack('<H', tx.mn_type or 0)
@@ -78,7 +131,8 @@ def _get_proregtx_payload(tx, inputs_hash):
             r += b'\x00'
     else:
         r += bytes(reversed(tx.collateral_hash))
-    r += pack('<I', tx.collateral_index or 0)
+    c_idx = tx.collateral_index or 0
+    r += pack('<I', c_idx)
     if tx.ip_address is None:
         for i in range(0, 16):
             r += b'\x00'
@@ -92,8 +146,13 @@ def _get_proregtx_payload(tx, inputs_hash):
     r += _encode_compact_int(len(tx.script_payout))
     r += tx.script_payout
     r += inputs_hash
+    return r
+
+
+def _get_proregtx_payload(tx, inputs_hash):
+    r = _get_proregtx_payload_comtent(tx, inputs_hash)
     if tx.payload_sig is not None:
-        r += _encode_compact_int(tx.payload_sig)
+        r += _encode_compact_int(len(tx.payload_sig))
         r += tx.payload_sig
     else:
         r += b"\x00"
@@ -133,7 +192,7 @@ async def confirm_tx_detail(ctx, title, data):
     return await confirm.require_confirm(ctx, text, ButtonRequestType.SignTx)
 
 
-async def confirm_special_params(tx, version, coin):
+async def confirm_special_params(tx, version, coin, inputs_hash):
     tx_type = version >> 16
     if tx_type == 1: # ProRegTx
         if not tx.payload_version == 1:
@@ -151,10 +210,100 @@ async def confirm_special_params(tx, version, coin):
                 "Empty"
             )
         else:
+            tx_req = TxRequest()
+            tx_req.details = TxRequestDetailsType()
+            collateral_txo = await helpers.request_tx_output(
+                tx_req, tx.collateral_index, tx.collateral_hash
+            )
+            if collateral_txo.amount != 1000 * _DASH_COIN:
+                raise SigningError(
+                    FailureType.ProcessError,
+                    "Invalid external collateral")
             yield UIConfirmTxDetail(
                 "External collateral",
                 "{}:{}".format(_to_hex(tx.collateral_hash), tx.collateral_index)
             )
+        yield UIConfirmTxDetail(
+            "Address and port",
+            "{}:{}".format(_inet_ntoa(tx.ip_address), tx.port)
+        )
+        owner_address =  _address_pkh_from_keyid(tx.key_id_owner, coin)
+        yield UIConfirmTxDetail(
+            "Owner address",
+            owner_address
+        )
+        yield UIConfirmTxDetail(
+            "Operator Public Key",
+            _to_hex(tx.pub_key_operator)
+        )
+        voting_address = _address_pkh_from_keyid(tx.key_id_voting, coin)
+        yield UIConfirmTxDetail(
+            "Voting address",
+            voting_address
+        )
+        operator_reward = 0
+        if tx.operator_reward is not None:
+            operator_reward = tx.operator_reward
+        if operator_reward > 10000:
+            raise SigningError(
+                FailureType.ProcessError,
+                "Invalid operator reward in ProRegTx"
+            )
+        yield UIConfirmTxDetail(
+            "Operator reward", "{:.2f}%".format(operator_reward / 100.0)
+        )
+        payout_address = _address_from_script(tx.script_payout, coin)
+        yield UIConfirmTxDetail(
+            "Payout address",
+            payout_address
+        )
+        if tx.collateral_hash is None and tx.payload_sig is not None:
+            raise SigningError(
+                FailureType.ProcessError,
+                "Empty collateral and not empty payload signature"
+            )
+        if tx.collateral_hash is not None and tx.payload_sig is None:
+            raise SigningError(
+                FailureType.ProcessError,
+                "No payload signature for external collateral"
+            )
+        if tx.payload_sig is not None:
+            print("payload sig from payload: ", _to_hex(tx.payload_sig))
+            res = (
+                payout_address
+                + "|"
+                + str(operator_reward)
+                + "|"
+                + owner_address
+                + "|"
+                + voting_address
+                + "|"
+            )
+            data_to_sign = _get_proregtx_payload_comtent(tx, inputs_hash)
+            print("Data to hash: ", _to_hex(data_to_sign))
+            data_hash = bytes(reversed(sha256(sha256(data_to_sign).digest()).digest()))
+            print("Data hash: ", _to_hex(data_hash))
+            res += _to_hex(data_hash)
+            print("Message to digest: ", res)
+            from apps.common.signverify import message_digest
+
+            digest = message_digest(coin, res)
+            print("Digest: ", _to_hex(digest))
+            key_from_sig = secp256k1.verify_recover(tx.payload_sig, digest)
+            if not key_from_sig:
+                raise SigningError(
+                    FailureType.ProcessError,
+                    "Can't get address from  payload signature"
+                )
+            address_from_sig = addresses.address_pkh(key_from_sig, coin)
+            address_from_txout = _address_from_script(
+                collateral_txo.script_pubkey, coin
+            )
+            if address_from_sig != address_from_txout:
+                raise SigningError(
+                    FailureType.ProcessError,
+                    "Invalid payload signature"
+                )
 
 
 # Phase 1
@@ -244,11 +393,12 @@ async def check_tx_fee(tx, version, keychain: seed.Keychain):
         if not await helpers.confirm_nondefault_locktime(tx.lock_time):
             raise SigningError(FailureType.ActionCancelled, "Locktime cancelled")
 
-    await confirm_special_params(tx, version, coin)
     # inputs hash should be double-sha256 hash
     h_double = utils.HashWriter(sha256())
     writers.write_bytes(h_double, h_inputs.get_digest())
-    extra_payload = _get_extra_payload(tx, version, h_double.get_digest())
+    inputs_hash = h_double.get_digest()
+    extra_payload = _get_extra_payload(tx, version, inputs_hash)
+    await confirm_special_params(tx, version, coin, inputs_hash)
     # add extra_data to hash
     writers.write_bytes(h_first, bytes(extra_payload))
 
