@@ -7,6 +7,8 @@ from trezor.crypto import base58, bip32, cashaddr, der
 from trezor.crypto.curve import secp256k1
 from trezor.crypto.hashlib import blake256, sha256
 from trezor.messages import ButtonRequestType, FailureType, InputScriptType, OutputScriptType
+from trezor.messages.DashSignProRegTx import DashSignProRegTx
+from trezor.messages.DashSignProUpServTx import DashSignProUpServTx
 from trezor.messages.TxInputType import TxInputType
 from trezor.messages.TxOutputBinType import TxOutputBinType
 from trezor.messages.TxOutputType import TxOutputType
@@ -161,14 +163,39 @@ def _get_proregtx_payload(tx, inputs_hash):
     return r
 
 
+def _get_proupservtx_payload(tx, inputs_hash):
+    r = bytes()
+    r += pack("<H", tx.payload_version)
+    r += bytes(reversed(tx.protx_hash))
+    if tx.ip_address is None:
+        for i in range(0, 16):
+            r += b'\x00'
+    else:
+        r += tx.ip_address
+    r += pack(">H", tx.port or 0)
+    if tx.script_payout is None:
+        r += b'\x00'
+    else:
+        r += _encode_compact_int(len(tx.script_payout))
+        r += tx.script_payout
+    r += inputs_hash
+    r += tx.payload_sig
+    payload_size = len(r)
+    r = _encode_compact_int(payload_size) + r
+    return r
+
+
 def _get_extra_payload(tx,  version, inputs_hash):
     tx_type = version >> 16
     if tx_type == 1:
         return _get_proregtx_payload(tx, inputs_hash)
-    raise SigningError(
-        FailureType.ProcessError,
-        "Unknown Special Dash Transaction type"
-    )
+    elif tx_type == 2:
+        return _get_proupservtx_payload(tx, inputs_hash)
+    else:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Unknown Special Dash Transaction type"
+        )
 
 
 # Transaction signing
@@ -192,118 +219,178 @@ async def confirm_tx_detail(ctx, title, data):
     return await confirm.require_confirm(ctx, text, ButtonRequestType.SignTx)
 
 
-async def confirm_special_params(tx, version, coin, inputs_hash):
-    tx_type = version >> 16
-    if tx_type == 1: # ProRegTx
-        if not tx.payload_version == 1:
+async def _confirm_proregtx_params(tx, coin, inputs_hash):
+    if not tx.payload_version == 1:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Unknown Dash Provider Register format version"
+        )
+    yield UIConfirmTxDetail(
+        "Masternode type",
+        "Type: {}, mode: {}".format(tx.mn_type, tx.mn_mode)
+    )
+    if tx.collateral_hash is None:
+        yield UIConfirmTxDetail(
+            "External collateral",
+            "Empty"
+        )
+    else:
+        tx_req = TxRequest()
+        tx_req.details = TxRequestDetailsType()
+        collateral_txo = await helpers.request_tx_output(
+            tx_req, tx.collateral_index, tx.collateral_hash
+        )
+        if collateral_txo.amount != 1000 * _DASH_COIN:
             raise SigningError(
                 FailureType.ProcessError,
-                "Unknown Dash Provider Register format version"
-            )
+                "Invalid external collateral")
         yield UIConfirmTxDetail(
-            "Masternode type",
-            "Type: {}, mode: {}".format(tx.mn_type, tx.mn_mode)
+            "External collateral",
+            "{}:{}".format(_to_hex(tx.collateral_hash), tx.collateral_index)
         )
-        if tx.collateral_hash is None:
-            yield UIConfirmTxDetail(
-                "External collateral",
-                "Empty"
+    yield UIConfirmTxDetail(
+        "Address and port",
+        "{}:{}".format(_inet_ntoa(tx.ip_address), tx.port)
+    )
+    owner_address = _address_pkh_from_keyid(tx.key_id_owner, coin)
+    yield UIConfirmTxDetail(
+        "Owner address",
+        owner_address
+    )
+    yield UIConfirmTxDetail(
+        "Operator Public Key",
+        _to_hex(tx.pub_key_operator)
+    )
+    voting_address = _address_pkh_from_keyid(tx.key_id_voting, coin)
+    yield UIConfirmTxDetail(
+        "Voting address",
+        voting_address
+    )
+    operator_reward = 0
+    if tx.operator_reward is not None:
+        operator_reward = tx.operator_reward
+    if operator_reward > 10000:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Invalid operator reward in ProRegTx"
+        )
+    yield UIConfirmTxDetail(
+        "Operator reward", "{:.2f}%".format(operator_reward / 100.0)
+    )
+    payout_address = _address_from_script(tx.script_payout, coin)
+    yield UIConfirmTxDetail(
+        "Payout address",
+        payout_address
+    )
+    if tx.collateral_hash is None and tx.payload_sig is not None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Empty collateral and not empty payload signature"
+        )
+    if tx.collateral_hash is not None and tx.payload_sig is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "No payload signature for external collateral"
+        )
+    if tx.payload_sig is not None:
+        print("payload sig from payload: ", _to_hex(tx.payload_sig))
+        res = (
+            payout_address
+            + "|"
+            + str(operator_reward)
+            + "|"
+            + owner_address
+            + "|"
+            + voting_address
+            + "|"
+        )
+        data_to_sign = _get_proregtx_payload_comtent(tx, inputs_hash)
+        print("Data to hash: ", _to_hex(data_to_sign))
+        data_hash = bytes(reversed(sha256(sha256(data_to_sign).digest()).digest()))
+        print("Data hash: ", _to_hex(data_hash))
+        res += _to_hex(data_hash)
+        print("Message to digest: ", res)
+        from apps.common.signverify import message_digest
+
+        digest = message_digest(coin, res)
+        print("Digest: ", _to_hex(digest))
+        key_from_sig = secp256k1.verify_recover(tx.payload_sig, digest)
+        if not key_from_sig:
+            raise SigningError(
+                FailureType.ProcessError,
+                "Can't get address from  payload signature"
             )
-        else:
-            tx_req = TxRequest()
-            tx_req.details = TxRequestDetailsType()
-            collateral_txo = await helpers.request_tx_output(
-                tx_req, tx.collateral_index, tx.collateral_hash
+        address_from_sig = addresses.address_pkh(key_from_sig, coin)
+        address_from_txout = _address_from_script(
+            collateral_txo.script_pubkey, coin
+        )
+        if address_from_sig != address_from_txout:
+            raise SigningError(
+                FailureType.ProcessError,
+                "Invalid payload signature"
             )
-            if collateral_txo.amount != 1000 * _DASH_COIN:
-                raise SigningError(
-                    FailureType.ProcessError,
-                    "Invalid external collateral")
-            yield UIConfirmTxDetail(
-                "External collateral",
-                "{}:{}".format(_to_hex(tx.collateral_hash), tx.collateral_index)
-            )
+
+
+async def _confirm_proupservtx_params(tx, coin, inputs_hash):
+    if not tx.payload_version == 1:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Unknown Dash Provider Update Service format version"
+        )
+    if tx.protx_hash is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "ProRegTx is required"
+        )
+    tx_req = TxRequest()
+    tx_req.details = TxRequestDetailsType()
+    proregtx = await helpers.request_tx_meta(tx_req, tx.protx_hash)
+    if proregtx.version != ((1 << 16) | 3):
+        raise SigningError(
+            FailureType.ProcessError,
+            "Invalid ProRegTx"
+        )
+    yield UIConfirmTxDetail(
+        "Initial ProRegTx", _to_hex(tx.protx_hash)
+    )
+    if tx.ip_address is None:
+        yield UIConfirmTxDetail(
+            "Address and port",
+            "Without changes"
+        )
+    else:
         yield UIConfirmTxDetail(
             "Address and port",
             "{}:{}".format(_inet_ntoa(tx.ip_address), tx.port)
         )
-        owner_address =  _address_pkh_from_keyid(tx.key_id_owner, coin)
-        yield UIConfirmTxDetail(
-            "Owner address",
-            owner_address
-        )
-        yield UIConfirmTxDetail(
-            "Operator Public Key",
-            _to_hex(tx.pub_key_operator)
-        )
-        voting_address = _address_pkh_from_keyid(tx.key_id_voting, coin)
-        yield UIConfirmTxDetail(
-            "Voting address",
-            voting_address
-        )
-        operator_reward = 0
-        if tx.operator_reward is not None:
-            operator_reward = tx.operator_reward
-        if operator_reward > 10000:
-            raise SigningError(
-                FailureType.ProcessError,
-                "Invalid operator reward in ProRegTx"
-            )
-        yield UIConfirmTxDetail(
-            "Operator reward", "{:.2f}%".format(operator_reward / 100.0)
-        )
-        payout_address = _address_from_script(tx.script_payout, coin)
+    if tx.script_payout is None:
         yield UIConfirmTxDetail(
             "Payout address",
-            payout_address
+            "Without changes"
         )
-        if tx.collateral_hash is None and tx.payload_sig is not None:
-            raise SigningError(
-                FailureType.ProcessError,
-                "Empty collateral and not empty payload signature"
-            )
-        if tx.collateral_hash is not None and tx.payload_sig is None:
-            raise SigningError(
-                FailureType.ProcessError,
-                "No payload signature for external collateral"
-            )
-        if tx.payload_sig is not None:
-            print("payload sig from payload: ", _to_hex(tx.payload_sig))
-            res = (
-                payout_address
-                + "|"
-                + str(operator_reward)
-                + "|"
-                + owner_address
-                + "|"
-                + voting_address
-                + "|"
-            )
-            data_to_sign = _get_proregtx_payload_comtent(tx, inputs_hash)
-            print("Data to hash: ", _to_hex(data_to_sign))
-            data_hash = bytes(reversed(sha256(sha256(data_to_sign).digest()).digest()))
-            print("Data hash: ", _to_hex(data_hash))
-            res += _to_hex(data_hash)
-            print("Message to digest: ", res)
-            from apps.common.signverify import message_digest
+    else:
+        yield UIConfirmTxDetail(
+            "Payout address",
+            _address_from_script(tx.script_payout, coin)
+        )
+    if tx.payload_sig is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Operator BLS signature is required"
+        )
+    if len(tx.payload_sig) != 96:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Invalid Operator BLS signature"
+        )
 
-            digest = message_digest(coin, res)
-            print("Digest: ", _to_hex(digest))
-            key_from_sig = secp256k1.verify_recover(tx.payload_sig, digest)
-            if not key_from_sig:
-                raise SigningError(
-                    FailureType.ProcessError,
-                    "Can't get address from  payload signature"
-                )
-            address_from_sig = addresses.address_pkh(key_from_sig, coin)
-            address_from_txout = _address_from_script(
-                collateral_txo.script_pubkey, coin
-            )
-            if address_from_sig != address_from_txout:
-                raise SigningError(
-                    FailureType.ProcessError,
-                    "Invalid payload signature"
-                )
+
+async def confirm_special_params(tx, version, coin, inputs_hash):
+    tx_type = version >> 16
+    if tx_type == 1: # ProRegTx
+        await _confirm_proregtx_params(tx, coin, inputs_hash)
+    if tx_type == 2: # ProUpServTx
+        await _confirm_proupservtx_params(tx, coin, inputs_hash)
 
 
 # Phase 1
@@ -397,9 +484,9 @@ async def check_tx_fee(tx, version, keychain: seed.Keychain):
     h_double = utils.HashWriter(sha256())
     writers.write_bytes(h_double, h_inputs.get_digest())
     inputs_hash = h_double.get_digest()
-    extra_payload = _get_extra_payload(tx, version, inputs_hash)
     await confirm_special_params(tx, version, coin, inputs_hash)
     # add extra_data to hash
+    extra_payload = _get_extra_payload(tx, version, inputs_hash)
     writers.write_bytes(h_first, bytes(extra_payload))
 
     if not await helpers.confirm_total(total_in - change_out, fee, coin):
@@ -409,7 +496,12 @@ async def check_tx_fee(tx, version, keychain: seed.Keychain):
 
 
 async def sign_tx(tx, keychain: seed.Keychain):
-    version = 3 | (1 << 16)
+    if type(tx) is DashSignProRegTx:
+        version = 3 | (1 << 16)
+    elif type(tx) is DashSignProUpServTx:
+        version = 3 | (2 << 16)
+    else:
+        version = 0
     tx.lock_time = tx.lock_time if tx.lock_time is not None else 0
     progress.init(tx.inputs_count, tx.outputs_count)
 
