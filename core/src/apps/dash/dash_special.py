@@ -8,6 +8,7 @@ from trezor.crypto.curve import secp256k1
 from trezor.crypto.hashlib import blake256, sha256
 from trezor.messages import ButtonRequestType, FailureType, InputScriptType, OutputScriptType
 from trezor.messages.DashSignProRegTx import DashSignProRegTx
+from trezor.messages.DashSignProUpRegTx import DashSignProUpRegTx
 from trezor.messages.DashSignProUpServTx import DashSignProUpServTx
 from trezor.messages.TxInputType import TxInputType
 from trezor.messages.TxOutputBinType import TxOutputBinType
@@ -52,6 +53,18 @@ class SigningError(ValueError):
 
 def _to_hex(data: bytes) -> str:
     return "".join("{:02x}".format(x) for x in data)
+
+
+def _compact_int_size(data: bytes):
+    size = 1
+    nit = data[0]
+    if nit == 253:
+        size += 2
+    elif nit == 254:
+        size += 4
+    elif nit == 255:
+        size += 8
+    return size
 
 
 def _encode_compact_int(n):
@@ -185,12 +198,39 @@ def _get_proupservtx_payload(tx, inputs_hash):
     return r
 
 
+def _get_proupregtx_payload_comtent(tx, inputs_hash):
+    r = bytes()
+    r += pack("<H", tx.payload_version)
+    r += bytes(reversed(tx.protx_hash))
+    r += pack('<H', tx.mn_mode or 0)
+    r += tx.pub_key_operator
+    r += tx.key_id_voting
+    r += _encode_compact_int(len(tx.script_payout))
+    r += tx.script_payout
+    r += inputs_hash
+    return r
+
+
+def _get_proupregtx_payload(tx, inputs_hash):
+    r = _get_proupregtx_payload_comtent(tx, inputs_hash)
+    if tx.payload_sig is not None:
+        r += _encode_compact_int(len(tx.payload_sig))
+        r += tx.payload_sig
+    else:
+        r += b"\x00"
+    payload_size = len(r)
+    r = _encode_compact_int(payload_size) + r
+    return r
+
+
 def _get_extra_payload(tx,  version, inputs_hash):
     tx_type = version >> 16
     if tx_type == 1:
         return _get_proregtx_payload(tx, inputs_hash)
     elif tx_type == 2:
         return _get_proupservtx_payload(tx, inputs_hash)
+    elif tx_type == 3:
+        return _get_proupregtx_payload(tx, inputs_hash)
     else:
         raise SigningError(
             FailureType.ProcessError,
@@ -293,7 +333,6 @@ async def _confirm_proregtx_params(tx, coin, inputs_hash):
             "No payload signature for external collateral"
         )
     if tx.payload_sig is not None:
-        print("payload sig from payload: ", _to_hex(tx.payload_sig))
         res = (
             payout_address
             + "|"
@@ -305,15 +344,11 @@ async def _confirm_proregtx_params(tx, coin, inputs_hash):
             + "|"
         )
         data_to_sign = _get_proregtx_payload_comtent(tx, inputs_hash)
-        print("Data to hash: ", _to_hex(data_to_sign))
         data_hash = bytes(reversed(sha256(sha256(data_to_sign).digest()).digest()))
-        print("Data hash: ", _to_hex(data_hash))
         res += _to_hex(data_hash)
-        print("Message to digest: ", res)
         from apps.common.signverify import message_digest
 
         digest = message_digest(coin, res)
-        print("Digest: ", _to_hex(digest))
         key_from_sig = secp256k1.verify_recover(tx.payload_sig, digest)
         if not key_from_sig:
             raise SigningError(
@@ -385,12 +420,113 @@ async def _confirm_proupservtx_params(tx, coin, inputs_hash):
         )
 
 
+async def _confirm_proupregtx_params(tx, coin, inputs_hash):
+    if not tx.payload_version == 1:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Unknown Dash Provider Update Registrar Transaction payload format version"
+        )
+
+    if tx.protx_hash is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "ProRegTx is required"
+        )
+    tx_req = TxRequest()
+    tx_req.details = TxRequestDetailsType()
+    proregtx = await helpers.request_tx_meta(tx_req, tx.protx_hash)
+    if proregtx.version != ((1 << 16) | 3):
+        raise SigningError(
+            FailureType.ProcessError,
+            "Invalid ProRegTx"
+        )
+    tx_req = TxRequest()
+    tx_req.details = TxRequestDetailsType()
+    ofs = 0
+    proregtx_payload = bytes()
+    while ofs < proregtx.extra_data_len:
+        size = min(1024, proregtx.extra_data_len - ofs)
+        chunk = await helpers.request_tx_extra_data(
+            tx_req, ofs, size, tx.protx_hash
+        )
+        proregtx_payload += chunk
+        ofs += len(chunk)
+    ownerkeyid_position = _compact_int_size(proregtx_payload) + 60
+    owner_keyid = proregtx_payload[ownerkeyid_position: ownerkeyid_position + 20]
+    yield UIConfirmTxDetail(
+        "Initial ProRegTx", _to_hex(tx.protx_hash)
+    )
+
+    yield UIConfirmTxDetail(
+        "Masternode type",
+        "Mode: {}".format(tx.mn_mode or 0)
+    )
+
+    if tx.pub_key_operator is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Operator BLS Pub Key is required"
+        )
+    yield UIConfirmTxDetail(
+        "Operator Public Key",
+        _to_hex(tx.pub_key_operator)
+    )
+
+    if tx.key_id_voting is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Voting Key is required"
+        )
+    voting_address = _address_pkh_from_keyid(tx.key_id_voting, coin)
+    yield UIConfirmTxDetail(
+        "Voting address",
+        voting_address
+    )
+
+    if tx.script_payout is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Payout Script is required"
+        )
+    payout_address = _address_from_script(tx.script_payout, coin)
+    yield UIConfirmTxDetail(
+        "Payout ddress",
+        payout_address
+    )
+    if tx.payload_sig is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Payload Signature is required"
+        )
+        data_to_sign = _get_proupregtx_payload_comtent(tx, inputs_hash)
+        data_hash = sha256(sha256(data_to_sign).digest()).digest()
+        key_from_sig = secp256k1.verify_recover(tx.payload_sig, data_hash)
+        if not key_from_sig:
+            raise SigningError(
+                FailureType.ProcessError,
+                "Can't get address from  payload signature"
+            )
+        keyid_from_sig = self.coin.script_hash(key_from_sig)
+        if keyid_from_sig != owner_keyid:
+            raise SigningError(
+                FailureType.ProcessError,
+                "Invalid payload signature"
+            )
+
+
 async def confirm_special_params(tx, version, coin, inputs_hash):
     tx_type = version >> 16
     if tx_type == 1: # ProRegTx
         await _confirm_proregtx_params(tx, coin, inputs_hash)
-    if tx_type == 2: # ProUpServTx
+    elif tx_type == 2: # ProUpServTx
         await _confirm_proupservtx_params(tx, coin, inputs_hash)
+    elif tx_type == 3: # ProUpRegTx
+        await _confirm_proupregtx_params(tx, coin, inputs_hash)
+    else:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Unknown Special Dash Transaction type"
+        )
 
 
 # Phase 1
@@ -500,6 +636,8 @@ async def sign_tx(tx, keychain: seed.Keychain):
         version = 3 | (1 << 16)
     elif type(tx) is DashSignProUpServTx:
         version = 3 | (2 << 16)
+    elif type(tx) is DashSignProUpRegTx:
+        version = 3 | (3 << 16)
     else:
         version = 0
     tx.lock_time = tx.lock_time if tx.lock_time is not None else 0
