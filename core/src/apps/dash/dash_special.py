@@ -9,6 +9,7 @@ from trezor.crypto.hashlib import blake256, sha256
 from trezor.messages import ButtonRequestType, FailureType, InputScriptType, OutputScriptType
 from trezor.messages.DashSignProRegTx import DashSignProRegTx
 from trezor.messages.DashSignProUpRegTx import DashSignProUpRegTx
+from trezor.messages.DashSignProUpRevTx import DashSignProUpRevTx
 from trezor.messages.DashSignProUpServTx import DashSignProUpServTx
 from trezor.messages.TxInputType import TxInputType
 from trezor.messages.TxOutputBinType import TxOutputBinType
@@ -135,6 +136,20 @@ def _address_from_script(data: bytes, coin: coininfo.CoinInfo) -> str:
     )
 
 
+# masternode registration revoke reason for user confirmation
+def _revoke_reason(idx: int) -> str:
+    if idx == 0:
+        return "Not Specified"
+    elif idx == 1:
+        return "Termination of Service"
+    elif idx == 2:
+        return "Compromised Keys"
+    elif idx == 3:
+        return "Change of Keys (Not compromised)"
+    # no error here, this reason is used only for information
+    return "Unknown revoke reason ({})".format(idx)
+
+
 def _get_proregtx_payload_comtent(tx, inputs_hash):
     r = bytes()
     r += pack("<H", tx.payload_version)
@@ -223,6 +238,18 @@ def _get_proupregtx_payload(tx, inputs_hash):
     return r
 
 
+def _get_prouprevtx_payload(tx, inputs_hash):
+    r = bytes()
+    r += pack("<H", tx.payload_version)
+    r += bytes(reversed(tx.protx_hash))
+    r += pack("<H", tx.reason)
+    r += inputs_hash
+    r += tx.payload_sig
+    payload_size = len(r)
+    r = _encode_compact_int(payload_size) + r
+    return r
+
+
 def _get_extra_payload(tx,  version, inputs_hash):
     tx_type = version >> 16
     if tx_type == 1:
@@ -231,6 +258,8 @@ def _get_extra_payload(tx,  version, inputs_hash):
         return _get_proupservtx_payload(tx, inputs_hash)
     elif tx_type == 3:
         return _get_proupregtx_payload(tx, inputs_hash)
+    elif tx_type == 4:
+        return _get_prouprevtx_payload(tx, inputs_hash)
     else:
         raise SigningError(
             FailureType.ProcessError,
@@ -498,20 +527,57 @@ async def _confirm_proupregtx_params(tx, coin, inputs_hash):
             FailureType.ProcessError,
             "Payload Signature is required"
         )
-        data_to_sign = _get_proupregtx_payload_comtent(tx, inputs_hash)
-        data_hash = sha256(sha256(data_to_sign).digest()).digest()
-        key_from_sig = secp256k1.verify_recover(tx.payload_sig, data_hash)
-        if not key_from_sig:
-            raise SigningError(
-                FailureType.ProcessError,
-                "Can't get address from  payload signature"
-            )
-        keyid_from_sig = self.coin.script_hash(key_from_sig)
-        if keyid_from_sig != owner_keyid:
-            raise SigningError(
-                FailureType.ProcessError,
-                "Invalid payload signature"
-            )
+    data_to_sign = _get_proupregtx_payload_comtent(tx, inputs_hash)
+    data_hash = sha256(sha256(data_to_sign).digest()).digest()
+    key_from_sig = secp256k1.verify_recover(tx.payload_sig, data_hash)
+    if not key_from_sig:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Can't get address from  payload signature"
+        )
+    keyid_from_sig = coin.script_hash(key_from_sig)
+    if keyid_from_sig != owner_keyid:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Invalid payload signature"
+        )
+
+
+async def _confirm_prouprevtx_params(tx, coin, inputs_hash):
+    if not tx.payload_version == 1:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Unknown Dash Provider Update Service format version"
+        )
+    if tx.protx_hash is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "ProRegTx is required"
+        )
+    tx_req = TxRequest()
+    tx_req.details = TxRequestDetailsType()
+    proregtx = await helpers.request_tx_meta(tx_req, tx.protx_hash)
+    if proregtx.version != ((1 << 16) | 3):
+        raise SigningError(
+            FailureType.ProcessError,
+            "Invalid ProRegTx"
+        )
+    yield UIConfirmTxDetail(
+        "Initial ProRegTx", _to_hex(tx.protx_hash)
+    )
+    yield UIConfirmTxDetail(
+        "Revoke reason", _revoke_reason(tx.reason or 0)
+    )
+    if tx.payload_sig is None:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Operator BLS signature is required"
+        )
+    if len(tx.payload_sig) != 96:
+        raise SigningError(
+            FailureType.ProcessError,
+            "Invalid Operator BLS signature"
+        )
 
 
 async def confirm_special_params(tx, version, coin, inputs_hash):
@@ -522,6 +588,8 @@ async def confirm_special_params(tx, version, coin, inputs_hash):
         await _confirm_proupservtx_params(tx, coin, inputs_hash)
     elif tx_type == 3: # ProUpRegTx
         await _confirm_proupregtx_params(tx, coin, inputs_hash)
+    elif tx_type == 4:  # ProUpRegTx
+        await _confirm_prouprevtx_params(tx, coin, inputs_hash)
     else:
         raise SigningError(
             FailureType.ProcessError,
@@ -638,6 +706,8 @@ async def sign_tx(tx, keychain: seed.Keychain):
         version = 3 | (2 << 16)
     elif type(tx) is DashSignProUpRegTx:
         version = 3 | (3 << 16)
+    elif type(tx) is DashSignProUpRevTx:
+        version = 3 | (4 << 16)
     else:
         version = 0
     tx.lock_time = tx.lock_time if tx.lock_time is not None else 0
